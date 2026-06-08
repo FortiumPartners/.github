@@ -6,6 +6,14 @@
 #                        `claude` label) by an org Member/Owner/Collaborator.
 #                        It NEVER auto-runs on issue-open or on every PR.
 #                        Pinned to Sonnet.
+#                        NOTE: the @claude mention gate keys off
+#                        `author_association`, which only reads OWNER/MEMBER
+#                        for org members with PUBLIC membership. A maintainer
+#                        with PRIVATE org membership will be seen as
+#                        CONTRIBUTOR/NONE and their @claude will be ignored
+#                        (fails safe — no run, no error). Such users should
+#                        either make membership public or use the `claude`
+#                        label (which requires triage permission) to trigger.
 #   2. security-review — runs on REAL pull requests only: non-draft,
 #                        non-bot author, at opened/reopened/ready_for_review
 #                        (NOT on every `synchronize` push). Pinned to Sonnet.
@@ -109,7 +117,7 @@ jobs:
     # Skipping `synchronize` avoids re-reviewing every WIP push; skipping
     # bots avoids reviewing every renovate/dependabot dependency bump.
     if: |
-      inputs.enable-security-review &&
+      inputs.enable-security-review == true &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
       github.event.sender.type != 'Bot' &&
@@ -126,7 +134,10 @@ jobs:
           fetch-depth: 0
 
       - name: Claude Code Security Review
-        uses: anthropics/claude-code-security-review@main
+        # Pinned to a SHA (no upstream release tags exist) to avoid a
+        # floating @main supply-chain ref. Bump deliberately when reviewing
+        # upstream changes. SHA = main @ 2026-06-08.
+        uses: anthropics/claude-code-security-review@0c6a49f1fa56a1d472575da86a94dbc1edb78eda
         with:
           claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           # Pin the model — unset defaults to claude-opus-4-1 (most expensive).
