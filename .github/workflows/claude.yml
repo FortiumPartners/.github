@@ -1,10 +1,22 @@
 # Fortium Partners — Shared Claude Code Workflow
 #
-# Provides two jobs for any repo in the org:
-#   1. claude - Issue triage, @claude mentions, PR auto-review with code-review plugin
-#   2. security-review - Security-focused scan on PRs
+# Two jobs, both gated for COST and SAFETY. Reusable via `workflow_call`.
 #
-# Usage in consuming repos:
+#   1. claude          — runs ONLY on an explicit `@claude` mention (or a
+#                        `claude` label) by an org Member/Owner/Collaborator.
+#                        It NEVER auto-runs on issue-open or on every PR.
+#                        Pinned to Sonnet.
+#   2. security-review — runs on REAL pull requests only: non-draft,
+#                        non-bot author, at opened/reopened/ready_for_review
+#                        (NOT on every `synchronize` push). Pinned to Sonnet.
+#
+# Why this shape: the previous version auto-ran the full agent on every
+# opened issue and ran an Opus-default security review on every PR push
+# (including renovate/dependabot), which billed the shared ANTHROPIC_API_KEY
+# heavily and let any opened issue trigger an unattended agent.
+#
+# Thin caller (consuming repo `.github/workflows/claude.yml`):
+#
 #   name: Claude Code
 #   on:
 #     issues:
@@ -14,28 +26,59 @@
 #     pull_request_review_comment:
 #       types: [created]
 #     pull_request:
-#       types: [opened, synchronize]
+#       types: [opened, reopened, ready_for_review, synchronize]
 #   jobs:
 #     claude:
 #       uses: FortiumPartners/.github/.github/workflows/claude.yml@main
 #       secrets: inherit
+#       # Optional overrides:
+#       # with:
+#       #   exclude-directories: "node_modules,dist,playwright-tests"
+#       #   enable-security-review: false
 
 name: Claude Code (Shared)
 
 on:
   workflow_call:
+    inputs:
+      agent-model:
+        type: string
+        default: claude-sonnet-4-6
+        description: Model for the @claude agent job.
+      security-review-model:
+        type: string
+        default: claude-sonnet-4-6
+        description: Model for the PR security review.
+      enable-security-review:
+        type: boolean
+        default: true
+        description: Set false to skip the PR security-review job entirely.
+      exclude-directories:
+        type: string
+        default: node_modules,dist,build,.next,coverage
+        description: Comma-separated dirs excluded from the security scan.
     secrets:
       ANTHROPIC_API_KEY:
         required: true
 
 jobs:
   claude:
+    # Explicit, authorized invocation ONLY. Never auto-run on issue-open
+    # or pull_request. Authorized = org Member/Owner/Collaborator, never a bot.
+    # (Applying the `claude` label already requires triage permission, so the
+    # label branch is implicitly authorized; the bot guard blocks bot labelers.)
     if: |
-      (github.event_name == 'issues' && github.event.action == 'opened') ||
-      (github.event_name == 'issues' && github.event.action == 'labeled' && contains(github.event.issue.labels.*.name, 'claude')) ||
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request')
+      github.event.sender.type != 'Bot' && (
+        (github.event_name == 'issue_comment' &&
+          contains(github.event.comment.body, '@claude') &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review_comment' &&
+          contains(github.event.comment.body, '@claude') &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'issues' &&
+          github.event.action == 'labeled' &&
+          github.event.label.name == 'claude')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -53,6 +96,8 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Pin the model — unset defaults to the most expensive tier.
+          claude_args: "--model ${{ inputs.agent-model }}"
           track_progress: true
           plugin_marketplaces: |
             https://github.com/anthropics/claude-plugins-official.git
@@ -60,7 +105,15 @@ jobs:
             code-review@claude-plugins-official
 
   security-review:
-    if: github.event_name == 'pull_request'
+    # Real PRs only: non-draft, non-bot, at open/reopen/ready_for_review.
+    # Skipping `synchronize` avoids re-reviewing every WIP push; skipping
+    # bots avoids reviewing every renovate/dependabot dependency bump.
+    if: |
+      inputs.enable-security-review &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.sender.type != 'Bot' &&
+      contains(fromJSON('["opened","reopened","ready_for_review"]'), github.event.action)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -76,3 +129,6 @@ jobs:
         uses: anthropics/claude-code-security-review@main
         with:
           claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Pin the model — unset defaults to claude-opus-4-1 (most expensive).
+          claude-model: ${{ inputs.security-review-model }}
+          exclude-directories: ${{ inputs.exclude-directories }}
