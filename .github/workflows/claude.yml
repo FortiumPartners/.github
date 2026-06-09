@@ -109,7 +109,9 @@ jobs:
           fetch-depth: 0
 
       - name: Run Claude Code Action
-        uses: anthropics/claude-code-action@v1
+        # SHA-pinned (not the moving @v1 major tag) so a re-pointed tag can't
+        # silently change the agent. SHA = v1 tag @ 2026-06-09.
+        uses: anthropics/claude-code-action@593d7a5c4e0073569f74772c2b7b64c30ec14707
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # Pin the model — unset defaults to the most expensive tier.
@@ -135,7 +137,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
+      # No id-token: the security-review action authenticates with
+      # claude-api-key and posts via github.token — it never requests an
+      # OIDC token. Omitting it removes an unused OIDC escalation surface
+      # (the token-exchange step abused in the GMO Flatt attack).
     steps:
       - uses: actions/checkout@v4
         with:
