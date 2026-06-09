@@ -37,8 +37,16 @@
 #       types: [opened, reopened, ready_for_review, synchronize]
 #   jobs:
 #     claude:
-#       uses: FortiumPartners/.github/.github/workflows/claude.yml@main
-#       secrets: inherit
+#       # Pin to a commit SHA (or release tag), NOT @main. @main is a moving
+#       # ref: a malicious change to this public repo's main would execute in
+#       # your repo on the next event. A SHA requires a deliberate, reviewed
+#       # bump (Renovate can automate it).
+#       uses: FortiumPartners/.github/.github/workflows/claude.yml@<commit-sha>
+#       # Pass ONLY the key this workflow needs — never `secrets: inherit`,
+#       # which would hand this shared workflow ALL of your repo's secrets
+#       # (DB creds, deploy keys, cloud creds) if it were ever compromised.
+#       secrets:
+#         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #       # Optional overrides:
 #       # with:
 #       #   exclude-directories: "node_modules,dist,playwright-tests"
