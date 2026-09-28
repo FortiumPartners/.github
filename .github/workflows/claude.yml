@@ -74,6 +74,8 @@ on:
         default: node_modules,dist,build,.next,coverage
         description: Comma-separated dirs excluded from the security scan.
     secrets:
+      # Used only by security-review: claude-code-security-review has no
+      # federation support yet. The claude job authenticates by federation.
       ANTHROPIC_API_KEY:
         required: true
 
@@ -110,10 +112,19 @@ jobs:
 
       - name: Run Claude Code Action
         # SHA-pinned (not the moving @v1 major tag) so a re-pointed tag can't
-        # silently change the agent. SHA = v1 tag @ 2026-06-09.
-        uses: anthropics/claude-code-action@593d7a5c4e0073569f74772c2b7b64c30ec14707
+        # silently change the agent. SHA = v1 tag @ 2026-09-25, which includes
+        # the fix for federation + plugins failing with jti_reused
+        # (anthropics/claude-code-action#1407); the 2026-06-09 pin predated it.
+        uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # No API key: the job exchanges its GitHub OIDC token for a short-lived
+          # Anthropic token (workload identity federation, Fortium Software org,
+          # GitHub Actions workspace). The rule accepts only this workflow file in
+          # FortiumPartners. None of these IDs is a secret.
+          anthropic_federation_rule_id: fdrl_01PFiHc7DKGfteqTfdgWGo3N
+          anthropic_organization_id: ffb150e6-b19e-40ed-92a1-72e5061c6dcb
+          anthropic_service_account_id: svac_01MLJi4ksGDjGWq5mvT935Zd
+          anthropic_workspace_id: wrkspc_01DjRb8W4JJaCipyPugTZ2Fs
           # Pin the model — unset defaults to the most expensive tier.
           claude_args: "--model ${{ inputs.agent-model }}"
           track_progress: true
