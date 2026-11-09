@@ -89,6 +89,11 @@ class GateFailsWhenNoReviewRan(unittest.TestCase):
     def test_no_findings_list(self):
         self.assert_fails({"pr_number": 7})
 
+    def test_review_marked_incomplete(self):
+        # _extract_security_findings returns this when Claude exits 0 but its
+        # reply holds no parseable findings; the audit script passes it through.
+        self.assert_fails({"findings": [], "analysis_summary": {"review_completed": False}})
+
     def test_error_text_cannot_inject_workflow_commands(self):
         proc = self.assert_fails({"error": "x\n::add-mask::y\n::stop-commands::z"})
         stray = [l for l in proc.stdout.splitlines() if l.startswith("::") and not l.startswith("::error::")]
