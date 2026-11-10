@@ -167,3 +167,45 @@ jobs:
           # Pin the model — unset defaults to claude-opus-4-1 (most expensive).
           claude-model: ${{ inputs.security-review-model }}
           exclude-directories: ${{ inputs.exclude-directories }}
+          # The action caches a "reserved" marker BEFORE it calls Claude and
+          # skips the scan whenever a marker exists, so re-running a refused
+          # review would scan nothing. The job's `if:` already excludes
+          # `synchronize`, so this only re-reviews on a re-run or reopen.
+          run-every-commit: true
+
+      - name: Fail when no review ran
+        id: review-gate
+        # The action turns a refused or crashed review into a warning and
+        # findings_count=0, so the job went green on reviews that never
+        # happened (FortiumPartners/.github#6: HTTP 400 at the spend cap,
+        # 2026-10-16..30). Its audit script writes {"error": ...} on every
+        # failure path and a findings list on success. Exit status is not
+        # exposed, and it is 1 on HIGH findings anyway, so read the file.
+        shell: bash
+        run: |
+          results=claudecode-results.json
+          log_hint="see claudecode-error.log in the security-review-results artifact"
+          if [ ! -s "$results" ]; then
+            echo "::error::Security review produced no results; $log_hint"
+            exit 1
+          fi
+          if ! jq -e 'type == "object"' "$results" >/dev/null 2>&1; then
+            echo "::error::Security review results are not a JSON object; $log_hint"
+            exit 1
+          fi
+          if jq -e 'has("error")' "$results" >/dev/null; then
+            # One line, so error text cannot start a workflow command.
+            msg=$(jq -r '.error | tostring | gsub("[\r\n]+"; " ")' "$results")
+            echo "::error::Security review did not run: $msg"
+            exit 1
+          fi
+          if ! jq -e '.findings | type == "array"' "$results" >/dev/null; then
+            echo "::error::Security review results hold no findings list; $log_hint"
+            exit 1
+          fi
+          # Claude exited 0 but its reply held no parseable findings.
+          if jq -e '.analysis_summary.review_completed == false' "$results" >/dev/null; then
+            echo "::error::Security review did not complete: Claude's reply held no findings; $log_hint"
+            exit 1
+          fi
+          echo "Security review ran: $(jq '.findings | length' "$results") finding(s)."
