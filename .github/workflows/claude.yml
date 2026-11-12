@@ -17,6 +17,11 @@
 #   2. security-review — runs on REAL pull requests only: non-draft,
 #                        non-bot author, at opened/reopened/ready_for_review
 #                        (NOT on every `synchronize` push). Pinned to Sonnet.
+#                        Skipped on PRs labelled `claude-session` (reviewed by
+#                        /loop-pr-review); a merged one without `loop-clean`
+#                        gets a backstop review, filed as an issue by
+#                        backstop-issue. pr-labels reads the live labels;
+#                        clear-loop-clean drops `loop-clean` on a push (#4).
 #
 # Why this shape: the previous version auto-ran the full agent on every
 # opened issue and ran an Opus-default security review on every PR push
@@ -34,7 +39,7 @@
 #     pull_request_review_comment:
 #       types: [created]
 #     pull_request:
-#       types: [opened, reopened, ready_for_review, synchronize]
+#       types: [opened, reopened, ready_for_review, synchronize, closed]
 #   jobs:
 #     claude:
 #       # Pin to a commit SHA (or release tag), NOT @main. @main is a moving
@@ -133,16 +138,63 @@ jobs:
           plugins: |
             code-review@claude-plugins-official
 
-  security-review:
-    # Real PRs only: non-draft, non-bot, at open/reopen/ready_for_review.
-    # Skipping `synchronize` avoids re-reviewing every WIP push; skipping
-    # bots avoids reviewing every renovate/dependabot dependency bump.
+  pr-labels:
+    # Reads the PR's LIVE labels for security-review (#4). `gh pr create
+    # --label` applies the label about a second after the PR opens, as a
+    # separate `labeled` event, so the `opened` payload does not carry it.
+    # A label applied after this read is missed, and the paid review runs:
+    # that direction costs money, never an unreviewed merge.
     if: |
       inputs.enable-security-review == true &&
       github.event_name == 'pull_request' &&
-      github.event.pull_request.draft == false &&
-      github.event.sender.type != 'Bot' &&
       contains(fromJSON('["opened","reopened","ready_for_review"]'), github.event.action)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: read
+      pull-requests: read
+    outputs:
+      session: ${{ steps.labels.outputs.session }}
+      loop_clean: ${{ steps.labels.outputs.loop_clean }}
+    steps:
+      - name: Read PR labels
+        id: labels
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          labels=$(gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name')
+          has() { grep -qxF "$1" <<<"$labels"; }
+          if has claude-session; then echo "session=true"; else echo "session=false"; fi >> "$GITHUB_OUTPUT"
+          if has loop-clean; then echo "loop_clean=true"; else echo "loop_clean=false"; fi >> "$GITHUB_OUTPUT"
+
+  security-review:
+    # Two modes (#4):
+    #  - open: real PRs only (non-draft, non-bot) at open/reopen/
+    #    ready_for_review, and NOT labelled `claude-session`. A session PR is
+    #    reviewed by /loop-pr-review before merge. Skipping `synchronize`
+    #    avoids re-reviewing every WIP push; skipping bots avoids reviewing
+    #    every renovate/dependabot bump. If pr-labels failed, its outputs are
+    #    empty and the PR is reviewed.
+    #  - backstop: a merged `claude-session` PR without `loop-clean`, i.e.
+    #    merged without a clean local loop. Labels come from the `closed`
+    #    payload, which is current at merge. backstop-issue files the result.
+    needs: pr-labels
+    if: |
+      always() &&
+      inputs.enable-security-review == true &&
+      github.event_name == 'pull_request' && (
+        (contains(fromJSON('["opened","reopened","ready_for_review"]'), github.event.action) &&
+          github.event.pull_request.draft == false &&
+          github.event.sender.type != 'Bot' &&
+          needs.pr-labels.outputs.session != 'true') ||
+        (github.event.action == 'closed' &&
+          github.event.pull_request.merged == true &&
+          contains(github.event.pull_request.labels.*.name, 'claude-session') &&
+          !contains(github.event.pull_request.labels.*.name, 'loop-clean'))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -167,6 +219,8 @@ jobs:
           # Pin the model — unset defaults to claude-opus-4-1 (most expensive).
           claude-model: ${{ inputs.security-review-model }}
           exclude-directories: ${{ inputs.exclude-directories }}
+          # Backstop runs on a merged PR: its output is an issue, not a review.
+          comment-pr: ${{ github.event.action != 'closed' }}
           # The action caches a "reserved" marker BEFORE it calls Claude and
           # skips the scan whenever a marker exists, so re-running a refused
           # review would scan nothing. The job's `if:` already excludes
@@ -209,3 +263,98 @@ jobs:
             exit 1
           fi
           echo "Security review ran: $(jq '.findings | length' "$results") finding(s)."
+
+  backstop-issue:
+    # Files the backstop review's result as an issue (#4). Nobody watches the
+    # checks of a merged PR, so findings, or a review that did not run, have
+    # to land somewhere a person will see. Only this job may write issues.
+    needs: security-review
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      contains(fromJSON('["success","failure"]'), needs.security-review.result)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: needs.security-review.result == 'success'
+        with:
+          name: security-review-results
+
+      - name: File backstop issue
+        id: file-issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          REVIEW_RESULT: ${{ needs.security-review.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          pr_url="https://github.com/$REPO/pull/$PR"
+          if [ "$REVIEW_RESULT" != "success" ]; then
+            title="security-review backstop: merged PR #$PR was not reviewed"
+            printf 'Merged PR %s carried the claude-session label without loop-clean, so the backstop security review ran on it, and the review did not complete (%s).\n\nRun: %s\n\nReview the PR by hand or re-run the job once the API is available.\n' \
+              "$pr_url" "$REVIEW_RESULT" "$RUN_URL" > body.md
+            labels=(bug P1)
+          else
+            results=claudecode-results.json
+            n=$(jq '.findings | length' "$results")
+            if [ "$n" -eq 0 ]; then
+              echo "Backstop review of merged PR #$PR found nothing." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            title="security-review backstop: $n finding(s) in merged PR #$PR"
+            {
+              printf 'Merged PR %s carried the claude-session label without loop-clean, so the backstop security review ran on the merged code.\n\nRun: %s\n\n' "$pr_url" "$RUN_URL"
+              jq -r '.findings[] | "### \(.severity // "?") \(.category // "") at `\(.file // "?"):\(.line // "?")`\n\n\(.description // "")\n\n**Recommendation:** \(.recommendation // "")\n"' "$results"
+            } > body.md
+            if jq -e 'any(.findings[]; (.severity // "" | ascii_upcase) == "HIGH")' "$results" >/dev/null; then
+              labels=(bug security P1)
+            else
+              labels=(bug security P2)
+            fi
+          fi
+          args=()
+          for l in "${labels[@]}"; do
+            gh api "repos/$REPO/labels/$l" >/dev/null 2>&1 || gh label create "$l" -R "$REPO"
+            args+=(--label "$l")
+          done
+          gh issue create -R "$REPO" --title "$title" --body-file body.md "${args[@]}"
+
+  clear-loop-clean:
+    # A push to a PR means its head was never through the loop that applied
+    # `loop-clean` (#4). Sessions remove the label after their own pushes;
+    # this catches a push from a person or another tool, which would
+    # otherwise let the PR merge past the backstop. Keyed off the push-time
+    # payload, so the loop's own later re-label is never undone.
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      contains(github.event.pull_request.labels.*.name, 'loop-clean')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Remove loop-clean
+        id: clear
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if out=$(gh api -X DELETE "repos/$REPO/issues/$PR/labels/loop-clean" 2>&1); then
+            echo "Removed loop-clean from #$PR."
+          elif grep -q "HTTP 404" <<<"$out"; then
+            echo "loop-clean was already gone from #$PR."
+          else
+            printf '%s\n' "$out"
+            echo "::error::Could not remove loop-clean from #$PR."
+            exit 1
+          fi
