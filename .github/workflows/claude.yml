@@ -328,8 +328,12 @@ jobs:
               labels=(bug security P2)
             fi
           fi
-          # A re-run must not file the same issue twice.
-          existing=$(gh issue list -R "$REPO" --state open --search "\"$title\" in:title" --json url --jq '.[0].url // empty')
+          # A re-run must not file the same issue twice. Only an open issue
+          # this workflow filed, with exactly this title, counts: the title
+          # search is fuzzy, and anyone could open a look-alike issue.
+          existing=$(gh issue list -R "$REPO" --state open --author app/github-actions \
+              --search "\"$title\" in:title" --json url,title \
+            | jq -r --arg t "$title" 'map(select(.title == $t))[0].url // empty')
           if [ -n "$existing" ]; then
             echo "Already filed: $existing"
             exit 0
