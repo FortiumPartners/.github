@@ -40,8 +40,18 @@
 #       types: [created]
 #     pull_request:
 #       types: [opened, reopened, ready_for_review, synchronize, closed]
+#       # A repo that turns off the open-time review keeps only
+#       # [synchronize, closed]: the backstop and the loop-clean reset.
 #   jobs:
 #     claude:
+#       # The most any job here needs; a job asking for more than its caller
+#       # grants fails to start.
+#       permissions:
+#         actions: read
+#         contents: write
+#         pull-requests: write
+#         issues: write
+#         id-token: write
 #       # Pin to a commit SHA (or release tag), NOT @main. @main is a moving
 #       # ref: a malicious change to this public repo's main would execute in
 #       # your repo on the next event. A SHA requires a deliberate, reviewed
@@ -155,7 +165,6 @@ jobs:
       pull-requests: read
     outputs:
       session: ${{ steps.labels.outputs.session }}
-      loop_clean: ${{ steps.labels.outputs.loop_clean }}
     steps:
       - name: Read PR labels
         id: labels
@@ -165,10 +174,8 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          labels=$(gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name')
-          has() { grep -qxF "$1" <<<"$labels"; }
-          if has claude-session; then echo "session=true"; else echo "session=false"; fi >> "$GITHUB_OUTPUT"
-          if has loop-clean; then echo "loop_clean=true"; else echo "loop_clean=false"; fi >> "$GITHUB_OUTPUT"
+          labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --jq '.[].name')
+          if grep -qxF claude-session <<<"$labels"; then echo "session=true"; else echo "session=false"; fi >> "$GITHUB_OUTPUT"
 
   security-review:
     # Two modes (#4):
@@ -311,13 +318,21 @@ jobs:
             title="security-review backstop: $n finding(s) in merged PR #$PR"
             {
               printf 'Merged PR %s carried the claude-session label without loop-clean, so the backstop security review ran on the merged code.\n\nRun: %s\n\n' "$pr_url" "$RUN_URL"
-              jq -r '.findings[] | "### \(.severity // "?") \(.category // "") at `\(.file // "?"):\(.line // "?")`\n\n\(.description // "")\n\n**Recommendation:** \(.recommendation // "")\n"' "$results"
+              # A zero-width space after each @ keeps finding text, which
+              # quotes the PR's code, from notifying users and teams.
+              jq -r '.findings[] | "### \(.severity // "?") \(.category // "") at `\(.file // "?"):\(.line // "?")`\n\n\(.description // "")\n\n**Recommendation:** \(.recommendation // "")\n" | gsub("@"; "@​")' "$results"
             } > body.md
             if jq -e 'any(.findings[]; (.severity // "" | ascii_upcase) == "HIGH")' "$results" >/dev/null; then
               labels=(bug security P1)
             else
               labels=(bug security P2)
             fi
+          fi
+          # A re-run must not file the same issue twice.
+          existing=$(gh issue list -R "$REPO" --state open --search "\"$title\" in:title" --json url --jq '.[0].url // empty')
+          if [ -n "$existing" ]; then
+            echo "Already filed: $existing"
+            exit 0
           fi
           args=()
           for l in "${labels[@]}"; do
@@ -331,7 +346,8 @@ jobs:
     # `loop-clean` (#4). Sessions remove the label after their own pushes;
     # this catches a push from a person or another tool, which would
     # otherwise let the PR merge past the backstop. Keyed off the push-time
-    # payload, so the loop's own later re-label is never undone.
+    # payload; if this job waits in the runner queue past a re-label, it
+    # strips the new label too, and the merge costs one backstop review.
     if: |
       github.event_name == 'pull_request' &&
       github.event.action == 'synchronize' &&
