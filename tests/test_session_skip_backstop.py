@@ -29,7 +29,7 @@ GH_STUB = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$GH_LOG"
 case "$*" in
   *"/labels"*"--jq"*) printf '%s' "${STUB_LABELS:-}" | tr ',' '\n'; exit 0 ;;
-  "issue list"*) printf '%s' "${STUB_EXISTING:-}"; exit 0 ;;
+  "issue list"*) printf '%s' "${STUB_EXISTING:-[]}"; exit 0 ;;
   "api -X DELETE"*)
     case "${STUB_DELETE:-ok}" in
       ok) exit 0 ;;
@@ -201,12 +201,29 @@ class BackstopIssue(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, fails(proc))
         self.assertIn("--label P2", self.issue_calls(calls)[0])
 
+    def existing(self, title):
+        return json.dumps([{"url": "https://github.com/o/r/issues/7", "title": title}])
+
     def test_rerun_does_not_duplicate_open_issue(self):
         proc, calls, _, _ = self.run_file(
-            FINDINGS, STUB_EXISTING="https://github.com/o/r/issues/7")
+            FINDINGS, STUB_EXISTING=self.existing("security-review backstop: 2 finding(s) in merged PR #42"))
         self.assertEqual(proc.returncode, 0, fails(proc))
         self.assertEqual(self.issue_calls(calls), [])
         self.assertIn("issues/7", proc.stdout)
+
+    def test_near_title_is_not_a_duplicate(self):
+        # Title search is fuzzy: PR #42's search also returns #420's issue.
+        proc, calls, _, _ = self.run_file(
+            FINDINGS, STUB_EXISTING=self.existing("security-review backstop: 2 finding(s) in merged PR #420"))
+        self.assertEqual(proc.returncode, 0, fails(proc))
+        self.assertEqual(len(self.issue_calls(calls)), 1, calls)
+
+    def test_only_the_workflows_own_issues_count(self):
+        # Anyone who can open an issue could otherwise pre-empt the backstop.
+        _, calls, _, _ = self.run_file(FINDINGS, STUB_EXISTING="[]")
+        searches = [c for c in calls if c.startswith("issue list")]
+        self.assertEqual(len(searches), 1, calls)
+        self.assertIn("--author app/github-actions", searches[0])
 
     def test_failed_review_files_not_reviewed_issue(self):
         proc, calls, _, body = self.run_file(None, review="failure")
