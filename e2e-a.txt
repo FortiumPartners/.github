@@ -1,0 +1,1 @@
+e2e case A for #4: claude-session PR, merged into e2e/base-4 without loop-clean.
