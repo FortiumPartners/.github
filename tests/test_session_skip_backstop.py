@@ -28,7 +28,8 @@ WORKFLOW = pathlib.Path(__file__).resolve().parent.parent / ".github/workflows/c
 GH_STUB = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$GH_LOG"
 case "$*" in
-  *"/labels --jq"*) printf '%s' "${STUB_LABELS:-}" | tr ',' '\n'; exit 0 ;;
+  *"/labels"*"--jq"*) printf '%s' "${STUB_LABELS:-}" | tr ',' '\n'; exit 0 ;;
+  "issue list"*) printf '%s' "${STUB_EXISTING:-}"; exit 0 ;;
   "api -X DELETE"*)
     case "${STUB_DELETE:-ok}" in
       ok) exit 0 ;;
@@ -101,18 +102,21 @@ class PrLabels(unittest.TestCase):
         return out
 
     def test_session_pr(self):
-        self.assertEqual(self.outputs("claude-session"), {"session": "true", "loop_clean": "false"})
+        self.assertEqual(self.outputs("claude-session"), {"session": "true"})
 
     def test_unlabelled_pr(self):
-        self.assertEqual(self.outputs(""), {"session": "false", "loop_clean": "false"})
+        self.assertEqual(self.outputs(""), {"session": "false"})
 
     def test_both_labels(self):
-        self.assertEqual(self.outputs("bug,loop-clean,claude-session"),
-                         {"session": "true", "loop_clean": "true"})
+        self.assertEqual(self.outputs("bug,loop-clean,claude-session"), {"session": "true"})
 
     def test_label_name_must_match_whole(self):
-        self.assertEqual(self.outputs("not-claude-session,loop-clean-ish"),
-                         {"session": "false", "loop_clean": "false"})
+        self.assertEqual(self.outputs("not-claude-session,loop-clean-ish"), {"session": "false"})
+
+    def test_reads_past_the_default_page(self):
+        # The labels endpoint returns 30 per page by default.
+        _, calls, _, _ = run_step("pr-labels", "labels", {"STUB_LABELS": ""})
+        self.assertIn("per_page=100", calls[0])
 
 
 class ClearLoopClean(unittest.TestCase):
@@ -136,7 +140,7 @@ FINDINGS = {
         {"file": "api/auth.py", "line": 12, "severity": "HIGH", "category": "auth_bypass",
          "description": "Token check skipped", "recommendation": "Check the token"},
         {"file": "web/x.js", "line": 3, "severity": "MEDIUM", "category": "xss",
-         "description": "$(touch /tmp/pwned) `id` ::warning::injected", "recommendation": "Escape"},
+         "description": "`id` ::warning::injected", "recommendation": "Escape"},
     ]
 }
 
@@ -173,11 +177,36 @@ class BackstopIssue(unittest.TestCase):
         self.assertIn("--label P2", self.issue_calls(calls)[0])
 
     def test_finding_text_stays_literal(self):
-        proc, _, _, body = self.run_file(FINDINGS)
+        with tempfile.TemporaryDirectory() as d:
+            marker = pathlib.Path(d) / "pwned"
+            text = f"$(touch {marker}) `id` ::warning::injected"
+            finding = dict(FINDINGS["findings"][1], description=text)
+            proc, _, _, body = self.run_file({"findings": [finding]})
+            self.assertEqual(proc.returncode, 0, fails(proc))
+            self.assertIn(text, body)
+            self.assertNotIn("::warning::", proc.stdout)
+            self.assertFalse(marker.exists())
+
+    def test_mentions_do_not_notify(self):
+        finding = dict(FINDINGS["findings"][1], description="ping @octocat and @org/team",
+                       recommendation="ask @octocat")
+        proc, _, _, body = self.run_file({"findings": [finding]})
         self.assertEqual(proc.returncode, 0, fails(proc))
-        self.assertIn("$(touch /tmp/pwned) `id` ::warning::injected", body)
-        self.assertNotIn("::warning::", proc.stdout)
-        self.assertFalse(pathlib.Path("/tmp/pwned").exists())
+        self.assertNotRegex(body, r"@[A-Za-z0-9]")
+        self.assertIn("octocat", body)
+
+    def test_non_string_severity(self):
+        finding = dict(FINDINGS["findings"][1], severity=3)
+        proc, calls, _, _ = self.run_file({"findings": [finding]})
+        self.assertEqual(proc.returncode, 0, fails(proc))
+        self.assertIn("--label P2", self.issue_calls(calls)[0])
+
+    def test_rerun_does_not_duplicate_open_issue(self):
+        proc, calls, _, _ = self.run_file(
+            FINDINGS, STUB_EXISTING="https://github.com/o/r/issues/7")
+        self.assertEqual(proc.returncode, 0, fails(proc))
+        self.assertEqual(self.issue_calls(calls), [])
+        self.assertIn("issues/7", proc.stdout)
 
     def test_failed_review_files_not_reviewed_issue(self):
         proc, calls, _, body = self.run_file(None, review="failure")
@@ -199,6 +228,7 @@ class BackstopIssue(unittest.TestCase):
 class Wiring(unittest.TestCase):
     def test_security_review_needs_pr_labels(self):
         self.assertEqual(jobs()["security-review"].get("needs"), "pr-labels")
+        self.assertEqual(set(jobs()["pr-labels"]["outputs"]), {"session"})
 
     def test_backstop_turns_off_pr_comment(self):
         action = next(s for s in jobs()["security-review"]["steps"]
