@@ -1,0 +1,20 @@
+# Throwaway e2e for FortiumPartners/.github#4, on scratch base branch
+# e2e/base-4 only. Never merged to main. Uses a deliberately invalid key, so
+# a security-review that runs concludes failure (proof it ran) and costs $0.
+name: E2E security-review session skip
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, closed]
+
+jobs:
+  review:
+    uses: ./.github/workflows/claude.yml
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.SECURITY_REVIEW_E2E_KEY }}
