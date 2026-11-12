@@ -1,0 +1,1 @@
+e2e case C for #4: a push clears loop-clean; landed with loop-clean, no backstop.
