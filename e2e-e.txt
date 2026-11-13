@@ -1,1 +1,2 @@
 e2e case E for #4/#18: push to a loop-clean PR, land at once; the backstop must run.
+push after loop-clean.
