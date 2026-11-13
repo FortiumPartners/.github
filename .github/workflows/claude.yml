@@ -191,11 +191,17 @@ jobs:
           if [ "$ACTION" = closed ]; then
             clean=false
             if jq -e 'index("loop-clean") != null' <<<"$PAYLOAD_LABELS" >/dev/null; then
-              labeled_at=$(gh api --paginate "repos/$REPO/issues/$PR/events?per_page=100" \
-                --jq '.[] | select(.event == "labeled" and .label.name == "loop-clean") | .created_at' | sort | sed -n '$p')
-              # The head's first pull_request run on its branch is when it was pushed.
+              events=$(gh api --paginate "repos/$REPO/issues/$PR/events?per_page=100" \
+                --jq '.[] | select((.event == "labeled" and .label.name == "loop-clean") or .event == "head_ref_force_pushed") | "\(.event) \(.created_at)"')
+              labeled_at=$(awk '$1 == "labeled" {print $2}' <<<"$events" | sort | sed -n '$p')
+              forced_at=$(awk '$1 == "head_ref_force_pushed" {print $2}' <<<"$events" | sort | sed -n '$p')
+              # The head's first pull_request run on its branch is when it was
+              # pushed, unless a later force push brought an older SHA back.
               pushed_at=$(gh api --paginate "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" \
                 --jq '.workflow_runs[] | select(.head_branch == env.HEAD_REF) | .created_at' | sort | sed -n 1p)
+              if [ -n "$pushed_at" ] && [[ "$forced_at" > "$pushed_at" ]]; then
+                pushed_at=$forced_at
+              fi
               if [ -n "$labeled_at" ] && [ -n "$pushed_at" ] && [[ "$labeled_at" > "$pushed_at" ]]; then
                 clean=true
               fi

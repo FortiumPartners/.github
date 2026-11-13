@@ -30,7 +30,9 @@ printf '%s\n' "$*" >> "$GH_LOG"
 case "$*" in
   *"/events?"*)
     [ -n "${STUB_EVENTS_FAIL:-}" ] && { echo "gh: Server Error (HTTP 502)" >&2; exit 1; }
-    printf '%s' "${STUB_LABELED_AT:-}" | tr ',' '\n'; exit 0 ;;
+    for t in ${STUB_LABELED_AT//,/ }; do echo "labeled $t"; done
+    for t in ${STUB_FORCED_AT//,/ }; do echo "head_ref_force_pushed $t"; done
+    exit 0 ;;
   *"/actions/runs?"*) printf '%s' "${STUB_SUITES_AT:-}" | tr ',' '\n'; exit 0 ;;
   *"/labels"*"--jq"*) printf '%s' "${STUB_LABELS:-}" | tr ',' '\n'; exit 0 ;;
   "issue list"*) printf '%s' "${STUB_EXISTING:-[]}"; exit 0 ;;
@@ -155,6 +157,15 @@ class PrLabelsAtMerge(unittest.TestCase):
         suites = "2026-11-12T14:51:53Z,2026-11-12T14:48:55Z"
         self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:50:00Z",
                                     STUB_SUITES_AT=suites)[0], "true")
+
+    def test_force_push_after_label_does_not(self):
+        # A force push back to an old SHA keeps that SHA's early first run.
+        self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:51:44Z",
+                                    STUB_FORCED_AT="2026-11-12T14:55:00Z")[0], "false")
+
+    def test_force_push_before_label_exempts(self):
+        self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:51:44Z",
+                                    STUB_FORCED_AT="2026-11-12T14:50:00Z")[0], "true")
 
     def test_no_suite_does_not(self):
         self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:51:44Z",
