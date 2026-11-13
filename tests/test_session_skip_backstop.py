@@ -28,6 +28,10 @@ WORKFLOW = pathlib.Path(__file__).resolve().parent.parent / ".github/workflows/c
 GH_STUB = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$GH_LOG"
 case "$*" in
+  *"/events?"*)
+    [ -n "${STUB_EVENTS_FAIL:-}" ] && { echo "gh: Server Error (HTTP 502)" >&2; exit 1; }
+    printf '%s' "${STUB_LABELED_AT:-}" | tr ',' '\n'; exit 0 ;;
+  *"/actions/runs?"*) printf '%s' "${STUB_SUITES_AT:-}" | tr ',' '\n'; exit 0 ;;
   *"/labels"*"--jq"*) printf '%s' "${STUB_LABELS:-}" | tr ',' '\n'; exit 0 ;;
   "issue list"*) printf '%s' "${STUB_EXISTING:-[]}"; exit 0 ;;
   "api -X DELETE"*)
@@ -117,6 +121,70 @@ class PrLabels(unittest.TestCase):
         # The labels endpoint returns 30 per page by default.
         _, calls, _, _ = run_step("pr-labels", "labels", {"STUB_LABELS": ""})
         self.assertIn("per_page=100", calls[0])
+
+
+class PrLabelsAtMerge(unittest.TestCase):
+    """On a merge, loop-clean exempts the PR only if applied after the head was pushed."""
+
+    PUSH = "2026-11-12T14:48:55Z"
+
+    def run_closed(self, labels=("claude-session", "loop-clean"), **env):
+        base = {"ACTION": "closed", "PAYLOAD_LABELS": json.dumps(list(labels)),
+                "HEAD_SHA": "abc123", "HEAD_REF": "feat/x", "STUB_SUITES_AT": self.PUSH}
+        return run_step("pr-labels", "labels", {**base, **env})
+
+    def clean(self, **env):
+        proc, calls, out, _ = self.run_closed(**env)
+        self.assertEqual(proc.returncode, 0, fails(proc))
+        return out.get("clean_at_head"), calls
+
+    def test_label_after_push_exempts(self):
+        self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:51:44Z")[0], "true")
+
+    def test_stale_label_from_before_push_does_not(self):
+        self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:48:46Z")[0], "false")
+
+    def test_last_labeling_counts(self):
+        both = "2026-11-12T14:51:44Z,2026-11-12T14:48:46Z"
+        self.assertEqual(self.clean(STUB_LABELED_AT=both)[0], "true")
+
+    def test_same_second_does_not(self):
+        self.assertEqual(self.clean(STUB_LABELED_AT=self.PUSH)[0], "false")
+
+    def test_earliest_suite_is_the_push(self):
+        suites = "2026-11-12T14:51:53Z,2026-11-12T14:48:55Z"
+        self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:50:00Z",
+                                    STUB_SUITES_AT=suites)[0], "true")
+
+    def test_no_suite_does_not(self):
+        self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:51:44Z",
+                                    STUB_SUITES_AT="")[0], "false")
+
+    def test_no_labeled_event_does_not(self):
+        self.assertEqual(self.clean(STUB_LABELED_AT="")[0], "false")
+
+    def test_no_loop_clean_skips_the_lookup(self):
+        value, calls = self.clean(labels=("claude-session",))
+        self.assertEqual(value, "false")
+        self.assertEqual(calls, [])
+
+    def test_runs_are_read_for_the_head_on_its_branch(self):
+        _, calls = self.clean(STUB_LABELED_AT="2026-11-12T14:51:44Z")
+        runs = [c for c in calls if "actions/runs" in c]
+        self.assertEqual(len(runs), 1, calls)
+        self.assertIn("head_sha=abc123&event=pull_request", runs[0])
+        self.assertIn("env.HEAD_REF", runs[0])
+
+    def test_needs_no_permission_callers_lack(self):
+        # A nested job asking for more than the caller grants fails the run.
+        self.assertEqual(set(jobs()["pr-labels"]["permissions"]),
+                         {"actions", "issues", "pull-requests"})
+
+    def test_lookup_failure_fails_the_step(self):
+        # An empty output then reads as not clean, and the backstop runs.
+        proc, _, out, _ = self.run_closed(STUB_EVENTS_FAIL="1")
+        self.assertNotEqual(proc.returncode, 0, fails(proc))
+        self.assertNotEqual(out.get("clean_at_head"), "true")
 
 
 class ClearLoopClean(unittest.TestCase):
@@ -245,7 +313,13 @@ class BackstopIssue(unittest.TestCase):
 class Wiring(unittest.TestCase):
     def test_security_review_needs_pr_labels(self):
         self.assertEqual(jobs()["security-review"].get("needs"), "pr-labels")
-        self.assertEqual(set(jobs()["pr-labels"]["outputs"]), {"session"})
+        self.assertEqual(set(jobs()["pr-labels"]["outputs"]), {"session", "clean_at_head"})
+
+    def test_backstop_trusts_only_a_label_newer_than_the_push(self):
+        cond = jobs()["security-review"]["if"]
+        self.assertIn("needs.pr-labels.outputs.clean_at_head != 'true'", cond)
+        self.assertNotIn("'loop-clean'", cond)
+        self.assertIn("closed", jobs()["pr-labels"]["if"])
 
     def test_backstop_turns_off_pr_comment(self):
         action = next(s for s in jobs()["security-review"]["steps"]
