@@ -187,6 +187,7 @@ jobs:
           PAYLOAD_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          MERGED_AT: ${{ github.event.pull_request.merged_at }}
         run: |
           if [ "$ACTION" = closed ]; then
             clean=false
@@ -195,10 +196,15 @@ jobs:
                 --jq '.[] | select((.event == "labeled" and .label.name == "loop-clean") or .event == "head_ref_force_pushed") | "\(.event) \(.created_at)"')
               labeled_at=$(awk '$1 == "labeled" {print $2}' <<<"$events" | sort | sed -n '$p')
               forced_at=$(awk '$1 == "head_ref_force_pushed" {print $2}' <<<"$events" | sort | sed -n '$p')
-              # The head's first pull_request run on its branch is when it was
-              # pushed, unless a later force push brought an older SHA back.
+              # The head last arrived at its newest pull_request run on its
+              # branch before the merge, or at the last force push if later.
+              # A head can arrive more than once (push B, force back to A,
+              # fast-forward to B), and only the last arrival counts. A run
+              # from some other event before the merge only moves this later,
+              # which costs one review.
               pushed_at=$(gh api --paginate "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" \
-                --jq '.workflow_runs[] | select(.head_branch == env.HEAD_REF) | .created_at' | sort | sed -n 1p)
+                --jq '.workflow_runs[] | select(.head_branch == env.HEAD_REF) | .created_at' \
+                | awk -v merged="$MERGED_AT" '$1 < merged' | sort | sed -n '$p')
               if [ -n "$pushed_at" ] && [[ "$forced_at" > "$pushed_at" ]]; then
                 pushed_at=$forced_at
               fi
@@ -376,7 +382,10 @@ jobs:
           fi
           args=()
           for l in "${labels[@]}"; do
-            gh api "repos/$REPO/labels/$l" >/dev/null 2>&1 || gh label create "$l" -R "$REPO"
+            # A concurrent backstop may create it first, which fails our
+            # create; carry on only if the label now exists.
+            gh api "repos/$REPO/labels/$l" >/dev/null 2>&1 || gh label create "$l" -R "$REPO" \
+              || gh api "repos/$REPO/labels/$l" >/dev/null
             args+=(--label "$l")
           done
           gh issue create -R "$REPO" --title "$title" --body-file body.md "${args[@]}"

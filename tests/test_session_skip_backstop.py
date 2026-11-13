@@ -42,8 +42,16 @@ case "$*" in
       404) echo "gh: Label does not exist (HTTP 404)" >&2; exit 1 ;;
       *) echo "gh: Server Error (HTTP 500)" >&2; exit 1 ;;
     esac ;;
-  "api repos/"*"/labels/"*) [ "${STUB_LABEL_EXISTS:-yes}" = yes ] && exit 0; exit 1 ;;
-  "label create"*) exit 0 ;;
+  "api repos/"*"/labels/"*)
+    [ "${STUB_LABEL_EXISTS:-yes}" = yes ] && exit 0
+    [ -f "$GH_LOG.created" ] && exit 0
+    exit 1 ;;
+  "label create"*)
+    [ -n "${STUB_LABEL_CREATE_FAIL:-}" ] && { echo "gh: Server Error (HTTP 500)" >&2; exit 1; }
+    touch "$GH_LOG.created"
+    # Another backstop created it first: gh reports the conflict as an error.
+    [ -n "${STUB_LABEL_RACE:-}" ] && { echo "label already exists" >&2; exit 1; }
+    exit 0 ;;
   "issue create"*)
     while [ $# -gt 0 ]; do [ "$1" = "--body-file" ] && cp "$2" "$GH_BODY"; shift; done
     echo "https://github.com/o/r/issues/99"; exit 0 ;;
@@ -132,7 +140,8 @@ class PrLabelsAtMerge(unittest.TestCase):
 
     def run_closed(self, labels=("claude-session", "loop-clean"), **env):
         base = {"ACTION": "closed", "PAYLOAD_LABELS": json.dumps(list(labels)),
-                "HEAD_SHA": "abc123", "HEAD_REF": "feat/x", "STUB_SUITES_AT": self.PUSH}
+                "HEAD_SHA": "abc123", "HEAD_REF": "feat/x", "STUB_SUITES_AT": self.PUSH,
+                "MERGED_AT": "2026-11-12T15:00:00Z"}
         return run_step("pr-labels", "labels", {**base, **env})
 
     def clean(self, **env):
@@ -153,10 +162,22 @@ class PrLabelsAtMerge(unittest.TestCase):
     def test_same_second_does_not(self):
         self.assertEqual(self.clean(STUB_LABELED_AT=self.PUSH)[0], "false")
 
-    def test_earliest_suite_is_the_push(self):
-        suites = "2026-11-12T14:51:53Z,2026-11-12T14:48:55Z"
-        self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:50:00Z",
-                                    STUB_SUITES_AT=suites)[0], "true")
+    def test_latest_arrival_of_the_head_counts(self):
+        # Push B, force back to A, label A, fast-forward to B: B's newest
+        # run is after the label, so the label does not cover B.
+        runs = "2026-11-12T14:00:00Z,2026-11-12T14:03:00Z"
+        self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:02:00Z",
+                                    STUB_FORCED_AT="2026-11-12T14:01:00Z",
+                                    STUB_SUITES_AT=runs)[0], "false")
+
+    def test_runs_from_the_merge_itself_are_ignored(self):
+        runs = "2026-11-12T14:48:55Z,2026-11-12T15:00:00Z,2026-11-12T15:00:07Z"
+        self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:51:44Z",
+                                    STUB_SUITES_AT=runs)[0], "true")
+
+    def test_no_merge_time_does_not(self):
+        self.assertEqual(self.clean(STUB_LABELED_AT="2026-11-12T14:51:44Z",
+                                    MERGED_AT="")[0], "false")
 
     def test_force_push_after_label_does_not(self):
         # A force push back to an old SHA keeps that SHA's early first run.
@@ -312,6 +333,16 @@ class BackstopIssue(unittest.TestCase):
         self.assertIn("merged PR #42 was not reviewed", issues[0])
         self.assertIn("--label P1", issues[0])
         self.assertIn("https://github.com/o/r/actions/runs/1", body)
+
+    def test_label_created_concurrently_still_files(self):
+        proc, calls, _, _ = self.run_file(FINDINGS, STUB_LABEL_EXISTS="no", STUB_LABEL_RACE="1")
+        self.assertEqual(proc.returncode, 0, fails(proc))
+        self.assertEqual(len(self.issue_calls(calls)), 1, calls)
+
+    def test_label_create_failure_fails_the_step(self):
+        proc, calls, _, _ = self.run_file(FINDINGS, STUB_LABEL_EXISTS="no", STUB_LABEL_CREATE_FAIL="1")
+        self.assertNotEqual(proc.returncode, 0, fails(proc))
+        self.assertEqual(self.issue_calls(calls), [])
 
     def test_missing_label_is_created_first(self):
         proc, calls, _, _ = self.run_file(FINDINGS, STUB_LABEL_EXISTS="no")
