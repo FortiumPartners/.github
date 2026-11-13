@@ -7,11 +7,11 @@ Finding that shapes the design: on PR #7, `gh pr create --label` applied the lab
 
 ## Changes (one file plus tests: `.github/workflows/claude.yml`)
 
-1. **New `pr-labels` job** (no Claude call, `pull-requests: read`). It runs on `opened`/`reopened`/`ready_for_review` when `enable-security-review` is on. It reads the PR's **live** labels (`gh api repos/$REPO/issues/$N/labels?per_page=100`) and outputs `session` (true/false). Backstop mode reads the `closed` payload instead, which is current at merge. A label applied after this job reads won't be seen. That direction fails open to *cost* (the review runs), never to an unreviewed merge.
+1. **New `pr-labels` job** (no Claude call, `pull-requests: read`). It runs on `opened`/`reopened`/`ready_for_review` when `enable-security-review` is on. It reads the PR's **live** labels (`gh api repos/$REPO/issues/$N/labels?per_page=100`) and outputs `session` (true/false). On a merged `claude-session` PR it also outputs `clean_at_head`. That is true only when the payload carries `loop-clean` and its last `labeled` event (issue events API) postdates the head's first `pull_request` run on its branch (Actions runs API, `actions: read`), which marks when the head was pushed. A stale label from before a push that merged before clear-loop-clean ran is therefore ignored (#18). A failed lookup leaves the output empty, and that runs the backstop. A label applied after this job reads won't be seen. That direction fails open to *cost* (the review runs), never to an unreviewed merge.
 
 2. **`security-review` job** gets `needs: pr-labels`, and its `if:` becomes one of two modes:
    - **open:** action in opened/reopened/ready_for_review, non-draft, non-bot sender, and `session != 'true'`. Unlabelled PRs are reviewed exactly as today. A session PR shows the job as **skipped**.
-   - **backstop:** action `closed`, `pull_request.merged == true`, payload labels contain `claude-session` and not `loop-clean`.
+   - **backstop:** action `closed`, `pull_request.merged == true`, payload labels contain `claude-session`, and `clean_at_head != 'true'`.
    - Same checkout, action and `review-gate` step as now, so a refused backstop review goes red too. `comment-pr` is off in backstop mode, because the issue is the output. Permissions are unchanged, and the job holds no `issues: write`.
    - Checked: the action fetches the diff from `pulls/{n}` and `pulls/{n}/files` (github_action_audit.py:72-131), so it works on a merged PR. Checkout uses `github.sha`, which is the merge commit.
 
@@ -41,6 +41,7 @@ Use a throwaway caller (`uses: ./.github/workflows/claude.yml`, types including 
 3. `claude-session` PR merged into the scratch base without `loop-clean` → backstop runs, fails on the key, and `backstop-issue` files a "not reviewed" issue.
 4. Push to a PR carrying `loop-clean` → the label is gone.
 5. Merged `claude-session` PR *with* `loop-clean` → no backstop.
+6. Push to a PR with `loop-clean`, then land it at once, before clear-loop-clean runs → `clean_at_head=false`, and the backstop runs.
 Clean up afterwards: close the PRs, delete the scratch branches and secret, close the e2e issues.
 
 Then: `/code-review high <branch>`, open the PR with a `Plan:` line and the red runs, then `/loop-pr-review`. Merge needs Burke's OK (admin bypass, as for #10).

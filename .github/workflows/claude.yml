@@ -154,17 +154,27 @@ jobs:
     # separate `labeled` event, so the `opened` payload does not carry it.
     # A label applied after this read is missed, and the paid review runs:
     # that direction costs money, never an unreviewed merge.
+    # On a merged session PR it decides whether `loop-clean` covers the head:
+    # only a labeling after the head's push does. A push merged before
+    # clear-loop-clean ran would otherwise keep a stale label (#18). Any
+    # failure leaves the output empty, which runs the backstop.
     if: |
       inputs.enable-security-review == true &&
-      github.event_name == 'pull_request' &&
-      contains(fromJSON('["opened","reopened","ready_for_review"]'), github.event.action)
+      github.event_name == 'pull_request' && (
+        contains(fromJSON('["opened","reopened","ready_for_review"]'), github.event.action) ||
+        (github.event.action == 'closed' &&
+          github.event.pull_request.merged == true &&
+          contains(github.event.pull_request.labels.*.name, 'claude-session'))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      actions: read
       issues: read
       pull-requests: read
     outputs:
       session: ${{ steps.labels.outputs.session }}
+      clean_at_head: ${{ steps.labels.outputs.clean_at_head }}
     steps:
       - name: Read PR labels
         id: labels
@@ -173,7 +183,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          PAYLOAD_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
+          if [ "$ACTION" = closed ]; then
+            clean=false
+            if jq -e 'index("loop-clean") != null' <<<"$PAYLOAD_LABELS" >/dev/null; then
+              labeled_at=$(gh api --paginate "repos/$REPO/issues/$PR/events?per_page=100" \
+                --jq '.[] | select(.event == "labeled" and .label.name == "loop-clean") | .created_at' | sort | sed -n '$p')
+              # The head's first pull_request run on its branch is when it was pushed.
+              pushed_at=$(gh api --paginate "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" \
+                --jq '.workflow_runs[] | select(.head_branch == env.HEAD_REF) | .created_at' | sort | sed -n 1p)
+              if [ -n "$labeled_at" ] && [ -n "$pushed_at" ] && [[ "$labeled_at" > "$pushed_at" ]]; then
+                clean=true
+              fi
+              echo "loop-clean labeled at ${labeled_at:-never}; head pushed at ${pushed_at:-unknown}."
+            fi
+            echo "clean_at_head=$clean" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --jq '.[].name')
           if grep -qxF claude-session <<<"$labels"; then echo "session=true"; else echo "session=false"; fi >> "$GITHUB_OUTPUT"
 
@@ -185,9 +215,9 @@ jobs:
     #    avoids re-reviewing every WIP push; skipping bots avoids reviewing
     #    every renovate/dependabot bump. If pr-labels failed, its outputs are
     #    empty and the PR is reviewed.
-    #  - backstop: a merged `claude-session` PR without `loop-clean`, i.e.
-    #    merged without a clean local loop. Labels come from the `closed`
-    #    payload, which is current at merge. backstop-issue files the result.
+    #  - backstop: a merged `claude-session` PR whose head no clean local
+    #    loop covered: no `loop-clean`, or one applied before the head was
+    #    pushed (pr-labels' clean_at_head). backstop-issue files the result.
     needs: pr-labels
     if: |
       always() &&
@@ -200,7 +230,7 @@ jobs:
         (github.event.action == 'closed' &&
           github.event.pull_request.merged == true &&
           contains(github.event.pull_request.labels.*.name, 'claude-session') &&
-          !contains(github.event.pull_request.labels.*.name, 'loop-clean'))
+          needs.pr-labels.outputs.clean_at_head != 'true')
       )
     runs-on: ubuntu-latest
     timeout-minutes: 20
