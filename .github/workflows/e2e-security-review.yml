@@ -5,7 +5,9 @@ name: E2E security-review session skip
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review, synchronize, closed]
+    # Case E: no synchronize, so clear-loop-clean never runs and a label
+    # applied before the last push is still on the PR when it lands.
+    types: [opened, reopened, ready_for_review, closed]
 
 jobs:
   review:
